@@ -13,6 +13,8 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 90        # kills job if something hangs (1hr scan + buffer)
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # add this line
 
     steps:
       - name: Checkout code
