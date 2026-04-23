@@ -1,36 +1,39 @@
 name: Trading Scanner
-
+ 
 on:
   schedule:
     # 9:25 AM ET — UTC-4 in summer (EDT), UTC-5 in winter (EST)
     # Summer:  13:25 UTC  ← use this May–Nov
     # Winter:  14:25 UTC  ← use this Nov–Mar
     - cron: '25 13 * * 1-5'   # Mon–Fri 9:25 AM EDT
-
+ 
   workflow_dispatch:           # allows manual trigger from GitHub UI
-
+ 
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 90        # kills job if something hangs (1hr scan + buffer)
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # add this line
-
+ 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4.2.2
-
+ 
       - name: Set up Python
         uses: actions/setup-python@v5.6.0
         with:
           python-version: '3.11'
-
+          cache: 'pip'            # FIX: cache pip deps so installs are faster/reliable
+ 
       - name: Install dependencies
         run: pip install -r requirements.txt
-
+ 
       - name: Run trading scanner
         env:
           GMAIL_ADDRESS:      ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           TMOBILE_NUMBER:     ${{ secrets.TMOBILE_NUMBER }}
         run: python day_trading_scanner.py --account 10000 --risk 1.0
+        # FIX: don't let a non-zero exit code silently swallow the run — show it
+        continue-on-error: false
