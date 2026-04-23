@@ -177,6 +177,41 @@ def scrape_top_gainers(top_n: int = 5) -> list[dict]:
     except Exception as e:
         console.print(f"[yellow]⚠ Finviz scrape failed: {e}[/yellow]")
 
+    # ── Fallback 2: yfinance built-in screener (no scraping needed) ──────────
+    try:
+        console.print("[cyan]  Trying yfinance screener fallback…[/cyan]")
+        # Use well-known high-momentum tickers as a last-resort seed list
+        # yfinance doesn't expose a gainers API directly, so fetch a known
+        # set of volatile small-caps and rank by today's % change
+        seed = ["NVDA", "AMD", "TSLA", "AAPL", "AMZN", "META", "GOOGL", "MSFT",
+                "NFLX", "SOFI", "PLTR", "RIVN", "LCID", "NIO", "SNAP"]
+        records = []
+        for sym in seed:
+            try:
+                t = yf.Ticker(sym)
+                info = t.fast_info
+                price = getattr(info, "last_price", None) or 0
+                prev  = getattr(info, "previous_close", None) or price
+                chg   = ((price - prev) / prev * 100) if prev else 0
+                vol   = getattr(info, "three_month_average_volume", None) or 0
+                if price > 0:
+                    records.append({
+                        "ticker":     sym,
+                        "name":       sym,
+                        "price":      price,
+                        "change_pct": round(chg, 2),
+                        "volume":     int(vol),
+                        "source":     "yfinance-fallback",
+                    })
+            except Exception:
+                continue
+        records.sort(key=lambda x: x["change_pct"], reverse=True)
+        if records:
+            console.print(f"[green]✓[/green] yfinance fallback returned {len(records)} tickers")
+            return records[:top_n]
+    except Exception as e:
+        console.print(f"[yellow]⚠ yfinance fallback failed: {e}[/yellow]")
+
     console.print("[red]✗ All scrapers failed. Check internet connection.[/red]")
     return []
 
@@ -822,6 +857,16 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
     ))
     console.print()
 
+    # FIX: send a startup heartbeat so you know the job actually fired
+    if not dry_run:
+        now_str = datetime.now(ET).strftime("%H:%M")
+        send_sms(
+            f"🟢 Trading Scanner started [{now_str}]\n"
+            f"Scanning every {SCAN_INTERVAL_MINS} min until 10:30 AM ET.\n"
+            "Will text picks as found.",
+            dry_run=False
+        )
+
     while is_trading_window():
         scan_num += 1
         scan_start = datetime.now(ET)
@@ -874,6 +919,15 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
 
         else:
             console.print("[red]No gainers returned — scraper may be blocked.[/red]")
+            # FIX: alert via SMS so you know the job ran but scraper failed
+            if scan_num == 1:
+                now_str = datetime.now(ET).strftime("%H:%M")
+                send_sms(
+                    f"⚠ Trading Scanner [{now_str}] Scan #{scan_num}\n"
+                    "Scraper returned 0 gainers — Yahoo Finance/Finviz may be blocking.\n"
+                    "Check GitHub Actions logs.",
+                    dry_run=dry_run
+                )
 
         print_kill_switches(account, losses, down_pct)
 
