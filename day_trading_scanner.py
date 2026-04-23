@@ -12,10 +12,10 @@ Setup:
     1. Enable 2-Step Verification on your Google account (myaccount.google.com/security)
     2. Create a Gmail App Password at myaccount.google.com/apppasswords
        → App name: "Trading Scanner" → copy the 16-char password
-    3. Set these environment variables (or edit the constants below):
-         export GMAIL_ADDRESS="yourname@gmail.com"
-         export GMAIL_APP_PASSWORD="abcdefghijklmnop"   # 16 chars, no spaces
-         export TMOBILE_NUMBER="2025551234"              # your 10-digit iPhone number
+    3. Set these GitHub Secrets (repo Settings → Secrets → Actions):
+         GMAIL_ADDRESS       yourname@gmail.com
+         GMAIL_APP_PASSWORD  abcdefghijklmnop   # 16 chars, no spaces
+         TMOBILE_NUMBER      2025551234          # your 10-digit T-Mobile number
 
 Usage:
     python day_trading_scanner.py                        # uses env vars
@@ -29,6 +29,7 @@ import os
 import sys
 import time
 from datetime import datetime, time as dtime, timedelta
+from zoneinfo import ZoneInfo  # FIX: timezone-aware ET time (Python 3.9+)
 
 import pandas as pd
 import requests
@@ -40,10 +41,16 @@ from rich.table import Table
 from rich import box
 import ta
 
-# ── Gmail → T-Mobile SMS config — set via env vars or edit directly ──────────
-GMAIL_ADDRESS      = os.environ.get("GMAIL_ADDRESS",      "marcstaggers@gmail.com")   # yourname@gmail.com
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "avrprmgdhwfsvnzi")   # 16-char app password
-TMOBILE_NUMBER     = os.environ.get("TMOBILE_NUMBER",     "3014049369")   # 10 digits, no +1
+# ── Gmail → T-Mobile SMS config — set via GitHub Secrets, no hardcoded fallbacks ──
+# FIX: removed hardcoded credentials — rotate your Gmail App Password immediately
+# if this repo was ever public with the old values in it.
+GMAIL_ADDRESS      = os.environ.get("GMAIL_ADDRESS",      "")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+TMOBILE_NUMBER     = os.environ.get("TMOBILE_NUMBER",     "")
+
+# ── Timezone ──────────────────────────────────────────────────────────────────
+# FIX: GitHub Actions runners use UTC. Always convert to ET for time checks.
+ET = ZoneInfo("America/New_York")
 
 # ── Scheduler config ─────────────────────────────────────────────────────────
 SCAN_INTERVAL_MINS  = 5          # run every N minutes
@@ -59,7 +66,7 @@ HEADERS = {
     )
 }
 
-# ── Strategy parameters (from document) ───────────────────────────────────────
+# ── Strategy parameters ───────────────────────────────────────────────────────
 MIN_GAP_PCT        = 3.0
 MIN_PREMARKET_VOL  = 500_000
 MIN_RVOL           = 2.0
@@ -74,7 +81,8 @@ REWARD_RISK_RATIO  = 2.0
 MAX_DAILY_TRADES   = 3
 MAX_DAILY_LOSS_PCT = 3.0
 
-console = Console()
+# FIX: force_terminal=True so Rich output is visible in GitHub Actions logs (non-TTY)
+console = Console(force_terminal=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -97,6 +105,7 @@ def scrape_top_gainers(top_n: int = 5) -> list[dict]:
         soup = BeautifulSoup(resp.text, "html.parser")
 
         rows = soup.select("table tbody tr")
+        console.print(f"[dim]  Yahoo Finance: found {len(rows)} raw rows[/dim]")
         for row in rows[:top_n * 2]:          # grab extra, we'll filter below
             cols = row.find_all("td")
             if len(cols) < 6:
@@ -122,6 +131,8 @@ def scrape_top_gainers(top_n: int = 5) -> list[dict]:
         if tickers:
             console.print(f"[green]✓[/green] Scraped {len(tickers)} gainers from Yahoo Finance")
             return tickers[:top_n]
+        else:
+            console.print("[yellow]⚠ Yahoo Finance returned 0 parseable rows — page structure may have changed[/yellow]")
 
     except Exception as e:
         console.print(f"[yellow]⚠ Yahoo Finance scrape failed: {e}[/yellow]")
@@ -138,6 +149,7 @@ def scrape_top_gainers(top_n: int = 5) -> list[dict]:
 
         rows = soup.select("table.screener-table tr.table-light-row-cp, "
                            "table.screener-table tr.table-dark-row-cp")
+        console.print(f"[dim]  Finviz: found {len(rows)} raw rows[/dim]")
         for row in rows[:top_n * 2]:
             cols = row.find_all("td")
             if len(cols) < 10:
@@ -373,7 +385,7 @@ def evaluate_stock(stock: dict, df: pd.DataFrame, avg_30d_vol: float) -> dict:
         )
 
     # ── Entry Validity ───────────────────────────────────────────────────────
-    # Entry is valid if all 4 Phase 2 indicators align
+    # Entry is valid if 4 of 5 Phase 2 indicators align
     phase2_checks = [
         (is_long and above_vwap) or (not is_long and not above_vwap),
         (is_long and ema_bullish) or (not is_long and not ema_bullish),
@@ -409,8 +421,9 @@ def compute_position_size(price: float, stop: float,
     dollar_risk   = account * (risk_pct / 100)
     stop_distance = abs(price - stop)
     if stop_distance == 0:
-        return {"shares": 0, "dollar_risk": dollar_risk, "position_value": 0}
-    shares        = int(dollar_risk / stop_distance)
+        return {"shares": 0, "dollar_risk": dollar_risk, "position_value": 0,
+                "stop_distance": 0}
+    shares = int(dollar_risk / stop_distance)
     return {
         "shares":         shares,
         "dollar_risk":    round(dollar_risk, 2),
@@ -435,13 +448,13 @@ def print_header():
     console.print(Panel(
         "[bold cyan]Day Trading Scanner[/bold cyan]  •  "
         "Momentum Breakout + Multi-Indicator Confirmation\n"
-        f"[dim]{datetime.now().strftime('%A %B %d, %Y  %H:%M:%S')}[/dim]",
+        f"[dim]{datetime.now(ET).strftime('%A %B %d, %Y  %H:%M:%S')} ET[/dim]",
         box=box.DOUBLE_EDGE, expand=False
     ))
 
 
 def print_market_timing():
-    now = datetime.now().time()
+    now = datetime.now(ET).time()   # FIX: ET-aware time
     premarket  = dtime(8, 0) <= now < dtime(9, 30)
     prime_open = dtime(9, 30) <= now < dtime(10, 30)
     lunch_chop = dtime(11, 30) <= now < dtime(13, 30)
@@ -682,7 +695,7 @@ def send_sms(message: str, dry_run: bool = False) -> bool:
     if missing:
         console.print(
             f"[red]✗ SMS skipped — missing env vars: {', '.join(missing)}[/red]\n"
-            "[dim]  Set them or pass --no-sms to suppress this warning.[/dim]"
+            "[dim]  Set them as GitHub Secrets or pass --no-sms to suppress this warning.[/dim]"
         )
         return False
 
@@ -721,7 +734,7 @@ def send_sms(message: str, dry_run: bool = False) -> bool:
 def build_sms(scan_num: int, top: dict | None,
               valid_entries: list[dict], account: float, risk_pct: float) -> str:
     """Build a concise SMS message for the top pick."""
-    now_str = datetime.now().strftime("%H:%M")
+    now_str = datetime.now(ET).strftime("%H:%M")   # FIX: ET time in SMS
 
     if not top:
         return (
@@ -749,18 +762,20 @@ def build_sms(scan_num: int, top: dict | None,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7. SCHEDULER — 5-min loop, 9:30–10:30 AM
+# 7. SCHEDULER — 5-min loop, 9:30–10:30 AM ET
 # ══════════════════════════════════════════════════════════════════════════════
 
 def is_trading_window() -> bool:
-    """Return True if current time is within 9:30–10:30 AM."""
-    now = datetime.now().time()
+    """Return True if current ET time is within 9:30–10:30 AM."""
+    # FIX: was datetime.now().time() which uses UTC on GitHub Actions runners
+    now = datetime.now(ET).time()
     return TRADING_START <= now < TRADING_END
 
 
 def seconds_until_window() -> float:
-    """Seconds until 9:30 AM open. Returns 0 if already past open."""
-    now = datetime.now()
+    """Seconds until 9:30 AM ET open. Returns 0 if already past open."""
+    # FIX: was datetime.now() which uses UTC on GitHub Actions runners
+    now = datetime.now(ET)
     open_today = now.replace(hour=9, minute=30, second=0, microsecond=0)
     if now >= open_today:
         return 0.0
@@ -770,25 +785,25 @@ def seconds_until_window() -> float:
 def run_scheduler(account: float, risk_pct: float, top_n: int,
                   losses: int, down_pct: float, dry_run: bool):
     """
-    Loop: scan every 5 minutes between 9:30 and 10:30 AM, then exit.
+    Loop: scan every 5 minutes between 9:30 and 10:30 AM ET, then exit.
     Sends an SMS after each scan if a valid entry is found.
     """
     # ── Wait for market open if needed ──────────────────────────────────────
     wait_secs = seconds_until_window()
     if wait_secs > 0:
-        open_str = datetime.now().replace(
+        open_str = datetime.now(ET).replace(
             hour=9, minute=30, second=0).strftime("%H:%M")
         console.print(Panel(
-            f"[bold cyan]⏳ Market opens at {open_str}[/bold cyan]\n"
+            f"[bold cyan]⏳ Market opens at {open_str} ET[/bold cyan]\n"
             f"Waiting {wait_secs/60:.0f} minutes before first scan…\n"
-            "Will scan every 5 minutes from 9:30–10:30 AM.",
+            "Will scan every 5 minutes from 9:30–10:30 AM ET.",
             border_style="cyan", expand=False
         ))
         time.sleep(wait_secs)
 
     if not is_trading_window():
         console.print(
-            "[yellow]⚠ Outside the 9:30–10:30 AM window.[/yellow]\n"
+            "[yellow]⚠ Outside the 9:30–10:30 AM ET window.[/yellow]\n"
             "Use --run-once to force a single scan anytime."
         )
         return
@@ -797,22 +812,23 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
     scan_num   = 0
     texted     = set()   # tickers we've already texted this session
 
+    # FIX: was referencing undefined TWILIO_TO_NUMBER — now correctly uses TMOBILE_NUMBER
     console.print(Panel(
         f"[bold green]🟢 SCANNER STARTED[/bold green]\n"
         f"Running every {SCAN_INTERVAL_MINS} minutes  •  "
-        f"Window: 9:30 – 10:30 AM\n"
-        f"SMS {'DISABLED (dry run)' if dry_run else 'ENABLED → ' + (TWILIO_TO_NUMBER or 'number not set')}",
+        f"Window: 9:30 – 10:30 AM ET\n"
+        f"SMS {'DISABLED (dry run)' if dry_run else 'ENABLED → ' + (TMOBILE_NUMBER or 'number not set')}",
         border_style="green", expand=False
     ))
     console.print()
 
     while is_trading_window():
         scan_num += 1
-        scan_start = datetime.now()
+        scan_start = datetime.now(ET)
 
         console.rule(
             f"[bold cyan]SCAN #{scan_num}  —  "
-            f"{scan_start.strftime('%H:%M:%S')}[/bold cyan]"
+            f"{scan_start.strftime('%H:%M:%S')} ET[/bold cyan]"
         )
 
         # Run the full scan
@@ -865,21 +881,21 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
         if not is_trading_window():
             break
 
-        elapsed  = (datetime.now() - scan_start).total_seconds()
+        elapsed  = (datetime.now(ET) - scan_start).total_seconds()
         sleep_s  = max(0, SCAN_INTERVAL_MINS * 60 - elapsed)
-        next_at  = datetime.now() + timedelta(seconds=sleep_s)
+        next_at  = datetime.now(ET) + timedelta(seconds=sleep_s)
 
-        # Check if next scan would be after 10:30 AM
+        # Check if next scan would be after 10:30 AM ET
         if next_at.time() >= TRADING_END:
             console.print(
-                f"\n[dim]Next scan at {next_at.strftime('%H:%M')} "
+                f"\n[dim]Next scan at {next_at.strftime('%H:%M')} ET "
                 f"would be after 10:30 AM — stopping now.[/dim]"
             )
             break
 
         console.print(
             f"\n[dim]Next scan in {sleep_s/60:.1f} min  "
-            f"({next_at.strftime('%H:%M:%S')})[/dim]\n"
+            f"({next_at.strftime('%H:%M:%S')} ET)[/dim]\n"
         )
         time.sleep(sleep_s)
 
@@ -901,7 +917,7 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Day Trading Scanner — Momentum Breakout, 9:30–10:30 AM loop"
+        description="Day Trading Scanner — Momentum Breakout, 9:30–10:30 AM ET loop"
     )
     parser.add_argument("--account",  type=float, default=10_000,
                         help="Account size in USD (default: 10000)")
