@@ -837,10 +837,15 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
         time.sleep(wait_secs)
 
     if not is_trading_window():
-        console.print(
-            "[yellow]⚠ Outside the 9:30–10:30 AM ET window.[/yellow]\n"
-            "Use --run-once to force a single scan anytime."
+        now_str = datetime.now(ET).strftime("%H:%M")
+        msg = (
+            f"⚠ Trading Scanner [{now_str}]\n"
+            "Outside the 9:30–10:30 AM ET window — no scan run.\n"
+            "Check cron schedule or use --run-once."
         )
+        console.print(f"[yellow]{msg}[/yellow]")
+        if not dry_run:
+            send_sms(msg, dry_run=False)
         return
 
     # ── Scheduler loop ───────────────────────────────────────────────────────
@@ -910,24 +915,22 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
                     f"[dim]⏭  {top['ticker']} already texted this session — skipping SMS[/dim]"
                 )
             else:
-                # No valid pick — send a "nothing found" text only on scan 1
-                if scan_num == 1:
-                    send_sms(
-                        build_sms(scan_num, None, [], account, risk_pct),
-                        dry_run=dry_run
-                    )
+                # No valid pick this scan — notify every time (not just scan 1)
+                send_sms(
+                    build_sms(scan_num, None, [], account, risk_pct),
+                    dry_run=dry_run
+                )
 
         else:
             console.print("[red]No gainers returned — scraper may be blocked.[/red]")
             # FIX: alert via SMS so you know the job ran but scraper failed
-            if scan_num == 1:
-                now_str = datetime.now(ET).strftime("%H:%M")
-                send_sms(
-                    f"⚠ Trading Scanner [{now_str}] Scan #{scan_num}\n"
-                    "Scraper returned 0 gainers — Yahoo Finance/Finviz may be blocking.\n"
-                    "Check GitHub Actions logs.",
-                    dry_run=dry_run
-                )
+            now_str = datetime.now(ET).strftime("%H:%M")
+            send_sms(
+                f"⚠ Trading Scanner [{now_str}] Scan #{scan_num}\n"
+                "Scraper returned 0 gainers — Yahoo Finance/Finviz may be blocking.\n"
+                "Check GitHub Actions logs.",
+                dry_run=dry_run
+            )
 
         print_kill_switches(account, losses, down_pct)
 
@@ -963,6 +966,15 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
         "Close all positions by 3:45 PM.[/dim]",
         border_style="yellow"
     ))
+
+    # FIX: send a session-complete heartbeat so you know the job finished cleanly
+    if not dry_run:
+        now_str = datetime.now(ET).strftime("%H:%M")
+        send_sms(
+            f"🏁 Scanner done [{now_str}] — {scan_num} scan{'s' if scan_num != 1 else ''} completed.\n"
+            f"Picks texted: {', '.join(texted) if texted else 'none'}.",
+            dry_run=False
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
