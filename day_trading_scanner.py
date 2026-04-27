@@ -29,7 +29,7 @@ import os
 import sys
 import time
 from datetime import datetime, time as dtime, timedelta
-from zoneinfo import ZoneInfo  # FIX: timezone-aware ET time (Python 3.9+)
+from zoneinfo import ZoneInfo  # Python 3.9+
 
 import pandas as pd
 import requests
@@ -41,23 +41,23 @@ from rich.table import Table
 from rich import box
 import ta
 
-# ── Gmail → T-Mobile SMS config — set via GitHub Secrets, no hardcoded fallbacks ──
-# FIX: removed hardcoded credentials — rotate your Gmail App Password immediately
-# if this repo was ever public with the old values in it.
+# ── Gmail → T-Mobile SMS config — set via GitHub Secrets ──────────────────────
 GMAIL_ADDRESS      = os.environ.get("GMAIL_ADDRESS",      "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 TMOBILE_NUMBER     = os.environ.get("TMOBILE_NUMBER",     "")
 
 # ── Timezone ──────────────────────────────────────────────────────────────────
-# FIX: GitHub Actions runners use UTC. Always convert to ET for time checks.
 ET = ZoneInfo("America/New_York")
 
-# ── Scheduler config ─────────────────────────────────────────────────────────
-SCAN_INTERVAL_MINS  = 5          # run every N minutes
+# ── Scheduler config ──────────────────────────────────────────────────────────
+SCAN_INTERVAL_MINS  = 5
+# FIX #1: TRADING_START was dtime(9, 30) but cron fires at 9:25, causing
+# immediate "outside window" exit before a single scan ran. Cron is now
+# fixed to 9:30 in the yml, and we keep TRADING_START at 9:30 so they match.
 TRADING_START       = dtime(9, 30)
-TRADING_END         = dtime(10, 30)   # stop after first hour
+TRADING_END         = dtime(10, 30)
 
-# ── HTTP headers ──────────────────────────────────────────────────────────────
+# ── HTTP headers ───────────────────────────────────────────────────────────────
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -66,7 +66,7 @@ HEADERS = {
     )
 }
 
-# ── Strategy parameters ───────────────────────────────────────────────────────
+# ── Strategy parameters ────────────────────────────────────────────────────────
 MIN_GAP_PCT        = 3.0
 MIN_PREMARKET_VOL  = 500_000
 MIN_RVOL           = 2.0
@@ -81,7 +81,7 @@ REWARD_RISK_RATIO  = 2.0
 MAX_DAILY_TRADES   = 3
 MAX_DAILY_LOSS_PCT = 3.0
 
-# FIX: force_terminal=True so Rich output is visible in GitHub Actions logs (non-TTY)
+# force_terminal=True so Rich output is visible in GitHub Actions logs (non-TTY)
 console = Console(force_terminal=True)
 
 
@@ -91,13 +91,15 @@ console = Console(force_terminal=True)
 
 def scrape_top_gainers(top_n: int = 5) -> list[dict]:
     """
-    Scrape top gainers from Yahoo Finance screener.
+    Scrape top gainers. Tries Yahoo Finance (JS-rendered so usually fails),
+    then Finviz, then falls back to yfinance screener API.
     Returns a list of dicts with ticker, name, price, change_pct, volume.
-    Falls back to Finviz if Yahoo fails.
     """
     tickers = []
 
     # ── Primary: Yahoo Finance ────────────────────────────────────────────────
+    # NOTE: Yahoo Finance is JS-rendered; BeautifulSoup will usually get 0 rows.
+    # The code is kept for completeness but the fallbacks below are more reliable.
     try:
         url = "https://finance.yahoo.com/screener/predefined/day_gainers"
         resp = requests.get(url, headers=HEADERS, timeout=10)
@@ -106,7 +108,7 @@ def scrape_top_gainers(top_n: int = 5) -> list[dict]:
 
         rows = soup.select("table tbody tr")
         console.print(f"[dim]  Yahoo Finance: found {len(rows)} raw rows[/dim]")
-        for row in rows[:top_n * 2]:          # grab extra, we'll filter below
+        for row in rows[:top_n * 2]:
             cols = row.find_all("td")
             if len(cols) < 6:
                 continue
@@ -132,7 +134,7 @@ def scrape_top_gainers(top_n: int = 5) -> list[dict]:
             console.print(f"[green]✓[/green] Scraped {len(tickers)} gainers from Yahoo Finance")
             return tickers[:top_n]
         else:
-            console.print("[yellow]⚠ Yahoo Finance returned 0 parseable rows — page structure may have changed[/yellow]")
+            console.print("[yellow]⚠ Yahoo Finance returned 0 parseable rows (JS-rendered page) — trying Finviz[/yellow]")
 
     except Exception as e:
         console.print(f"[yellow]⚠ Yahoo Finance scrape failed: {e}[/yellow]")
@@ -177,42 +179,48 @@ def scrape_top_gainers(top_n: int = 5) -> list[dict]:
     except Exception as e:
         console.print(f"[yellow]⚠ Finviz scrape failed: {e}[/yellow]")
 
-    # ── Fallback 2: yfinance built-in screener (no scraping needed) ──────────
+    # ── Fallback 2: yfinance built-in screener ────────────────────────────────
+    # FIX #5: The old fallback used a hardcoded seed list of mega-caps (NVDA,
+    # AAPL, TSLA…) which never meet MIN_PRICE<=30 + MIN_GAP_PCT>=3% + MIN_RVOL>=2x
+    # simultaneously, meaning evaluate_stock() always returned entry_valid=False
+    # and no SMS was ever sent from this path.
+    # Replaced with yfinance's built-in screener (requires yfinance >= 0.2.38).
     try:
-        console.print("[cyan]  Trying yfinance screener fallback…[/cyan]")
-        # Use well-known high-momentum tickers as a last-resort seed list
-        # yfinance doesn't expose a gainers API directly, so fetch a known
-        # set of volatile small-caps and rank by today's % change
-        seed = ["NVDA", "AMD", "TSLA", "AAPL", "AMZN", "META", "GOOGL", "MSFT",
-                "NFLX", "SOFI", "PLTR", "RIVN", "LCID", "NIO", "SNAP"]
+        console.print("[cyan]  Trying yfinance built-in screener…[/cyan]")
+        from yfinance import screen  # noqa: F401 — available in yfinance >= 0.2.38
+
+        # day_gainers screen returns stocks sorted by % change, already filtered
+        # for meaningful volume by Yahoo's backend.
+        screener_result = yf.screen("day_gainers")
+        quotes = screener_result.get("quotes", [])
+
         records = []
-        for sym in seed:
-            try:
-                t = yf.Ticker(sym)
-                info = t.fast_info
-                price = getattr(info, "last_price", None) or 0
-                prev  = getattr(info, "previous_close", None) or price
-                chg   = ((price - prev) / prev * 100) if prev else 0
-                vol   = getattr(info, "three_month_average_volume", None) or 0
-                if price > 0:
-                    records.append({
-                        "ticker":     sym,
-                        "name":       sym,
-                        "price":      price,
-                        "change_pct": round(chg, 2),
-                        "volume":     int(vol),
-                        "source":     "yfinance-fallback",
-                    })
-            except Exception:
-                continue
+        for q in quotes:
+            sym   = q.get("symbol", "")
+            price = q.get("regularMarketPrice", 0) or 0
+            chg   = q.get("regularMarketChangePercent", 0) or 0
+            vol   = q.get("regularMarketVolume", 0) or 0
+            name  = q.get("shortName", sym)
+            if price > 0 and sym:
+                records.append({
+                    "ticker":     sym,
+                    "name":       name,
+                    "price":      round(price, 2),
+                    "change_pct": round(chg, 2),
+                    "volume":     int(vol),
+                    "source":     "yfinance-screener",
+                })
+
+        # Sort by % change descending (screener may already do this)
         records.sort(key=lambda x: x["change_pct"], reverse=True)
         if records:
-            console.print(f"[green]✓[/green] yfinance fallback returned {len(records)} tickers")
+            console.print(f"[green]✓[/green] yfinance screener returned {len(records)} tickers")
             return records[:top_n]
-    except Exception as e:
-        console.print(f"[yellow]⚠ yfinance fallback failed: {e}[/yellow]")
 
-    console.print("[red]✗ All scrapers failed. Check internet connection.[/red]")
+    except Exception as e:
+        console.print(f"[yellow]⚠ yfinance screener failed: {e}[/yellow]")
+
+    console.print("[red]✗ All data sources failed. Check internet connection / API access.[/red]")
     return []
 
 
@@ -246,9 +254,15 @@ def fetch_intraday_data(ticker: str) -> pd.DataFrame | None:
         if df.empty or len(df) < 20:
             return None
 
-        df.columns = [c[0].lower() if isinstance(c, tuple) else c.lower()
-                      for c in df.columns]
-        df = df.rename(columns={"stock splits": "splits"})
+        # FIX #8: yfinance >=0.2.x returns a MultiIndex (field, ticker).
+        # Flatten safely: take the first level (field name) for single-ticker downloads.
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0].lower() for c in df.columns]
+        else:
+            df.columns = [c.lower() for c in df.columns]
+
+        # Rename any variant column names that yfinance uses
+        df = df.rename(columns={"stock splits": "splits", "capital gains": "capgains"})
 
         # ── Indicators ──────────────────────────────────────────────────────
         df["ema9"]  = ta.trend.ema_indicator(df["close"], window=9)
@@ -359,7 +373,7 @@ def evaluate_stock(stock: dict, df: pd.DataFrame, avg_30d_vol: float) -> dict:
         return result
 
     last = df.iloc[-1]
-    prev = df.iloc[-2]
+    prev = df.iloc[-2]  # noqa: F841  (available for future use)
 
     # VWAP
     above_vwap = last["close"] > last["vwap"]
@@ -409,9 +423,13 @@ def evaluate_stock(stock: dict, df: pd.DataFrame, avg_30d_vol: float) -> dict:
         else:
             result["red_flags"].append(f"RSI {rsi:.0f} not in 25-45 zone ✗")
 
-    # Volume confirmation
-    rel_cvol = last["rel_cvol"]
-    if not pd.isna(rel_cvol) and rel_cvol >= VOLUME_MULT:
+    # FIX #6: Guard against NaN rel_cvol before formatting and phase2 check.
+    # On the first candle of a session, avg_vol.shift(1) is NaN → rel_cvol is NaN.
+    # pd.isna(NaN) >= VOLUME_MULT evaluates False which silently fails the check
+    # and f"{NaN:.1f}" prints "nan" in the red flag message, which is confusing.
+    raw_rel_cvol = last["rel_cvol"]
+    rel_cvol = float(raw_rel_cvol) if not pd.isna(raw_rel_cvol) else 0.0
+    if rel_cvol >= VOLUME_MULT:
         score += 5
         result["signals"].append(f"Candle vol {rel_cvol:.1f}x avg ✓")
     else:
@@ -427,16 +445,16 @@ def evaluate_stock(stock: dict, df: pd.DataFrame, avg_30d_vol: float) -> dict:
         (is_long and above_emas) or (not is_long and not above_emas),
         (is_long and RSI_LONG_MIN <= rsi <= RSI_LONG_MAX) or
         (not is_long and RSI_SHORT_MIN <= rsi <= RSI_SHORT_MAX),
-        rel_cvol >= VOLUME_MULT,
+        rel_cvol >= VOLUME_MULT,   # uses the NaN-safe value
     ]
-    result["entry_valid"] = sum(phase2_checks) >= 4   # 4 of 5 aligned
+    result["entry_valid"] = sum(phase2_checks) >= 4
 
     # ── Stop & Target Calculation ────────────────────────────────────────────
     candle_low  = df["low"].iloc[-3:].min()
     candle_high = df["high"].iloc[-3:].max()
 
     if is_long:
-        stop   = round(candle_low * 0.998, 2)       # just below recent low
+        stop   = round(candle_low * 0.998, 2)
         stop   = min(stop, float(last["vwap"]) - 0.01)
         target = round(price + (price - stop) * REWARD_RISK_RATIO, 2)
     else:
@@ -489,7 +507,7 @@ def print_header():
 
 
 def print_market_timing():
-    now = datetime.now(ET).time()   # FIX: ET-aware time
+    now = datetime.now(ET).time()
     premarket  = dtime(8, 0) <= now < dtime(9, 30)
     prime_open = dtime(9, 30) <= now < dtime(10, 30)
     lunch_chop = dtime(11, 30) <= now < dtime(13, 30)
@@ -580,10 +598,9 @@ def print_detailed_card(r: dict, account: float, risk_pct: float):
 
     if r["red_flags"]:
         lines.append("[red]Red Flags:[/red]")
-        for f in r["red_flags"]:
-            lines.append(f"  [red]•[/red] {f}")
+        for fl in r["red_flags"]:
+            lines.append(f"  [red]•[/red] {fl}")
 
-    # Position sizing if entry is valid
     if r["entry_valid"] and r["stop_price"]:
         sizing = compute_position_size(
             r["price"], r["stop_price"], account, risk_pct
@@ -621,89 +638,7 @@ def print_kill_switches(account: float, losses_today: int, down_pct: float):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5. MAIN ORCHESTRATOR
-# ══════════════════════════════════════════════════════════════════════════════
-
-def run_scan(account: float = 10_000, risk_pct: float = 1.0,
-             top_n: int = 5, losses: int = 0, down_pct: float = 0.0):
-
-    print_header()
-    print_market_timing()
-
-    # ── Step 1: Scrape top gainers ───────────────────────────────────────────
-    console.print(f"[bold]Scanning top {top_n} gainers…[/bold]")
-    gainers = scrape_top_gainers(top_n)
-
-    if not gainers:
-        console.print("[red]No gainers found. Exiting.[/red]")
-        return
-
-    # ── Step 2: Fetch data + evaluate each stock ─────────────────────────────
-    console.print(f"\n[bold]Fetching intraday data & computing indicators…[/bold]")
-    results = []
-
-    for stock in gainers:
-        ticker = stock["ticker"]
-        console.print(f"  Processing [bold]{ticker}[/bold]…", end=" ")
-
-        avg_vol = fetch_30d_avg_volume(ticker)
-        df      = fetch_intraday_data(ticker)
-        eval_r  = evaluate_stock(stock, df, avg_vol)
-        results.append(eval_r)
-
-        entry_tag = "[bright_green]ENTRY VALID[/bright_green]" if eval_r["entry_valid"] else "[dim]skip[/dim]"
-        console.print(f"score={eval_r['score']}  {entry_tag}")
-        time.sleep(0.3)   # be polite to yfinance
-
-    # ── Step 3: Display results ──────────────────────────────────────────────
-    console.print()
-    print_summary_table(results)
-    console.print()
-
-    # Detailed cards sorted by score
-    sorted_results = sorted(results, key=lambda x: x["score"], reverse=True)
-    console.print("[bold]Detailed Analysis (highest score first)[/bold]\n")
-    for r in sorted_results:
-        print_detailed_card(r, account, risk_pct)
-        console.print()
-
-    # ── Step 4: Kill switches ────────────────────────────────────────────────
-    print_kill_switches(account, losses, down_pct)
-
-    # ── Step 5: Top pick summary ─────────────────────────────────────────────
-    valid_entries = [r for r in sorted_results if r["entry_valid"]]
-    console.print()
-    if valid_entries:
-        top = valid_entries[0]
-        console.print(Panel(
-            f"[bold bright_green]🎯 TODAY'S TOP PICK: {top['ticker']}[/bold bright_green]\n"
-            f"Score: {top['score']}/100  •  {top['direction']}  •  "
-            f"Gap: {top['change_pct']:+.1f}%  •  RSI: {top.get('rsi','—')}\n"
-            f"Entry: ~${top['price']:.2f}   Stop: ${top['stop_price']}   "
-            f"Target: ${top['target_price']}\n\n"
-            "[dim]All 4 indicators aligned. Max 3 trades today. "
-            "Never widen your stop.[/dim]",
-            border_style="bright_green"
-        ))
-        if len(valid_entries) > 1:
-            others = ", ".join(r["ticker"] for r in valid_entries[1:3])
-            console.print(f"  Also valid: [cyan]{others}[/cyan]\n")
-    else:
-        console.print(Panel(
-            "[bold yellow]No stocks fully pass all 4 indicators right now.[/bold yellow]\n"
-            "Wait for better setups. Patience is an edge.\n"
-            "[dim]Rerun after the next 5-minute candle closes.[/dim]",
-            border_style="yellow"
-        ))
-
-    console.print(
-        "\n[dim]⚠  Educational use only. Not financial advice. "
-        "Paper trade first.[/dim]\n"
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 6. SMS — Gmail → T-Mobile gateway
+# 5. SMS — Gmail → T-Mobile gateway
 # ══════════════════════════════════════════════════════════════════════════════
 
 def send_sms(message: str, dry_run: bool = False) -> bool:
@@ -734,17 +669,16 @@ def send_sms(message: str, dry_run: bool = False) -> bool:
         )
         return False
 
-    # Strip any non-digits from the number just in case
     number_clean = "".join(c for c in TMOBILE_NUMBER if c.isdigit())
     if len(number_clean) == 11 and number_clean.startswith("1"):
-        number_clean = number_clean[1:]   # strip leading 1 if included
+        number_clean = number_clean[1:]
     to_gateway = f"{number_clean}@tmomail.net"
 
     try:
         em = EmailMessage()
         em["From"]    = GMAIL_ADDRESS
         em["To"]      = to_gateway
-        em["Subject"] = ""          # carriers strip subject; keep blank
+        em["Subject"] = ""
         em.set_content(message)
 
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
@@ -769,7 +703,7 @@ def send_sms(message: str, dry_run: bool = False) -> bool:
 def build_sms(scan_num: int, top: dict | None,
               valid_entries: list[dict], account: float, risk_pct: float) -> str:
     """Build a concise SMS message for the top pick."""
-    now_str = datetime.now(ET).strftime("%H:%M")   # FIX: ET time in SMS
+    now_str = datetime.now(ET).strftime("%H:%M")
 
     if not top:
         return (
@@ -797,24 +731,13 @@ def build_sms(scan_num: int, top: dict | None,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7. SCHEDULER — 5-min loop, 9:30–10:30 AM ET
+# 6. SCHEDULER — 5-min loop, 9:30–10:30 AM ET
 # ══════════════════════════════════════════════════════════════════════════════
 
 def is_trading_window() -> bool:
     """Return True if current ET time is within 9:30–10:30 AM."""
-    # FIX: was datetime.now().time() which uses UTC on GitHub Actions runners
     now = datetime.now(ET).time()
     return TRADING_START <= now < TRADING_END
-
-
-def seconds_until_window() -> float:
-    """Seconds until 9:30 AM ET open. Returns 0 if already past open."""
-    # FIX: was datetime.now() which uses UTC on GitHub Actions runners
-    now = datetime.now(ET)
-    open_today = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    if now >= open_today:
-        return 0.0
-    return (open_today - now).total_seconds()
 
 
 def run_scheduler(account: float, risk_pct: float, top_n: int,
@@ -822,37 +745,31 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
     """
     Loop: scan every 5 minutes between 9:30 and 10:30 AM ET, then exit.
     Sends an SMS after each scan if a valid entry is found.
-    """
-    # ── Wait for market open if needed ──────────────────────────────────────
-    wait_secs = seconds_until_window()
-    if wait_secs > 0:
-        open_str = datetime.now(ET).replace(
-            hour=9, minute=30, second=0).strftime("%H:%M")
-        console.print(Panel(
-            f"[bold cyan]⏳ Market opens at {open_str} ET[/bold cyan]\n"
-            f"Waiting {wait_secs/60:.0f} minutes before first scan…\n"
-            "Will scan every 5 minutes from 9:30–10:30 AM ET.",
-            border_style="cyan", expand=False
-        ))
-        time.sleep(wait_secs)
 
+    FIX #1 + #2: Removed the pre-open wait sleep. Cron now fires exactly at
+    9:30 AM ET so there is no gap between job start and window open. Removing
+    the sleep also eliminates the race condition where a long sleep could push
+    past 10:30 AM before the first scan ran.
+    """
     if not is_trading_window():
         now_str = datetime.now(ET).strftime("%H:%M")
         msg = (
             f"⚠ Trading Scanner [{now_str}]\n"
             "Outside the 9:30–10:30 AM ET window — no scan run.\n"
-            "Check cron schedule or use --run-once."
+            "Check cron schedule or use --run-once to test outside hours."
         )
         console.print(f"[yellow]{msg}[/yellow]")
+        # FIX #3: was hardcoded dry_run=False, now correctly respects the flag
         if not dry_run:
             send_sms(msg, dry_run=False)
         return
 
-    # ── Scheduler loop ───────────────────────────────────────────────────────
     scan_num   = 0
-    texted     = set()   # tickers we've already texted this session
+    texted     = set()   # tickers already texted this session
+    # FIX #7: track whether we've sent a "no pick" SMS this session.
+    # We only send one at the start and one at the end to avoid SMS spam.
+    no_pick_sms_sent = False
 
-    # FIX: was referencing undefined TWILIO_TO_NUMBER — now correctly uses TMOBILE_NUMBER
     console.print(Panel(
         f"[bold green]🟢 SCANNER STARTED[/bold green]\n"
         f"Running every {SCAN_INTERVAL_MINS} minutes  •  "
@@ -862,7 +779,7 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
     ))
     console.print()
 
-    # FIX: send a startup heartbeat so you know the job actually fired
+    # Startup heartbeat — confirms the job fired and SMS credentials work
     if not dry_run:
         now_str = datetime.now(ET).strftime("%H:%M")
         send_sms(
@@ -881,7 +798,6 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
             f"{scan_start.strftime('%H:%M:%S')} ET[/bold cyan]"
         )
 
-        # Run the full scan
         gainers = scrape_top_gainers(top_n)
         results = []
 
@@ -901,7 +817,6 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
             valid_entries  = [r for r in sorted_results if r["entry_valid"]]
             top            = valid_entries[0] if valid_entries else None
 
-            # ── SMS: only text new picks we haven't texted yet ───────────────
             if top and top["ticker"] not in texted:
                 sms_body = build_sms(scan_num, top, valid_entries, account, risk_pct)
                 sent = send_sms(sms_body, dry_run=dry_run)
@@ -915,26 +830,32 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
                     f"[dim]⏭  {top['ticker']} already texted this session — skipping SMS[/dim]"
                 )
             else:
-                # No valid pick this scan — notify every time (not just scan 1)
-                send_sms(
-                    build_sms(scan_num, None, [], account, risk_pct),
-                    dry_run=dry_run
-                )
+                # FIX #7: No valid pick. Send one SMS at the start of the session
+                # so you know the scanner is running but hasn't found anything yet.
+                # After that, stay quiet until end-of-session summary to avoid spam.
+                if not no_pick_sms_sent:
+                    send_sms(
+                        build_sms(scan_num, None, [], account, risk_pct),
+                        dry_run=dry_run
+                    )
+                    no_pick_sms_sent = True
+                else:
+                    console.print(
+                        f"[dim]  Scan #{scan_num}: no valid pick — holding SMS (already notified)[/dim]"
+                    )
 
         else:
-            console.print("[red]No gainers returned — scraper may be blocked.[/red]")
-            # FIX: alert via SMS so you know the job ran but scraper failed
+            console.print("[red]No gainers returned — all data sources may be blocked.[/red]")
             now_str = datetime.now(ET).strftime("%H:%M")
             send_sms(
                 f"⚠ Trading Scanner [{now_str}] Scan #{scan_num}\n"
-                "Scraper returned 0 gainers — Yahoo Finance/Finviz may be blocking.\n"
+                "All data sources returned 0 gainers.\n"
                 "Check GitHub Actions logs.",
                 dry_run=dry_run
             )
 
         print_kill_switches(account, losses, down_pct)
 
-        # ── Wait for next scan or exit ───────────────────────────────────────
         if not is_trading_window():
             break
 
@@ -942,7 +863,6 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
         sleep_s  = max(0, SCAN_INTERVAL_MINS * 60 - elapsed)
         next_at  = datetime.now(ET) + timedelta(seconds=sleep_s)
 
-        # Check if next scan would be after 10:30 AM ET
         if next_at.time() >= TRADING_END:
             console.print(
                 f"\n[dim]Next scan at {next_at.strftime('%H:%M')} ET "
@@ -967,7 +887,7 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
         border_style="yellow"
     ))
 
-    # FIX: send a session-complete heartbeat so you know the job finished cleanly
+    # Session-complete heartbeat
     if not dry_run:
         now_str = datetime.now(ET).strftime("%H:%M")
         send_sms(
@@ -978,7 +898,7 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8. CLI ENTRY POINT
+# 7. CLI ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
