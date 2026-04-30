@@ -45,6 +45,7 @@ import ta
 GMAIL_ADDRESS      = os.environ.get("GMAIL_ADDRESS",      "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 TMOBILE_NUMBER     = os.environ.get("TMOBILE_NUMBER",     "")
+EMAIL_TO           = os.environ.get("EMAIL_TO", GMAIL_ADDRESS)  # optional; defaults to sender Gmail
 
 # ── Timezone ──────────────────────────────────────────────────────────────────
 ET = ZoneInfo("America/New_York")
@@ -245,43 +246,52 @@ def _parse_volume(raw: str) -> int:
 
 def fetch_intraday_data(ticker: str) -> pd.DataFrame | None:
     """
-    Download 5-minute OHLCV data for today.
-    Returns a DataFrame with added indicator columns, or None on error.
+    Download 5-minute OHLCV data and keep only today's regular-session candles.
+    The strategy is only evaluated after the first 5-minute candle closes.
     """
     try:
         df = yf.download(ticker, period="2d", interval="5m",
-                         progress=False, auto_adjust=True)
+                         progress=False, auto_adjust=True, prepost=False)
         if df.empty or len(df) < 20:
             return None
 
-        # FIX #8: yfinance >=0.2.x returns a MultiIndex (field, ticker).
-        # Flatten safely: take the first level (field name) for single-ticker downloads.
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [c[0].lower() for c in df.columns]
         else:
             df.columns = [c.lower() for c in df.columns]
 
-        # Rename any variant column names that yfinance uses
         df = df.rename(columns={"stock splits": "splits", "capital gains": "capgains"})
 
-        # ── Indicators ──────────────────────────────────────────────────────
+        if df.index.tz is None:
+            df.index = df.index.tz_localize(ET)
+        else:
+            df.index = df.index.tz_convert(ET)
+
+        now_et = datetime.now(ET)
+        today = now_et.date()
+        session_start = datetime.combine(today, TRADING_START, tzinfo=ET)
+
+        last_completed = now_et.replace(second=0, microsecond=0)
+        minute_floor = (last_completed.minute // 5) * 5
+        last_completed = last_completed.replace(minute=minute_floor) - timedelta(minutes=5)
+
+        df = df[(df.index >= session_start) & (df.index <= last_completed)]
+        if df.empty or len(df) < 2:
+            return None
+
         df["ema9"]  = ta.trend.ema_indicator(df["close"], window=9)
         df["ema20"] = ta.trend.ema_indicator(df["close"], window=20)
         df["rsi"]   = ta.momentum.rsi(df["close"], window=14)
+        df["vwap"]  = _compute_vwap(df)
 
-        # VWAP (session-level)
-        df["vwap"] = _compute_vwap(df)
-
-        # Relative candle volume (vs session avg so far)
         df["avg_vol"]  = df["volume"].expanding().mean()
         df["rel_cvol"] = df["volume"] / df["avg_vol"].shift(1).fillna(1)
 
-        return df
+        return df.dropna(subset=["ema9", "ema20", "rsi", "vwap"])
 
     except Exception as e:
         console.print(f"  [red]✗ Data fetch failed for {ticker}: {e}[/red]")
         return None
-
 
 def _compute_vwap(df: pd.DataFrame) -> pd.Series:
     """Intraday VWAP reset each session day."""
@@ -438,16 +448,14 @@ def evaluate_stock(stock: dict, df: pd.DataFrame, avg_30d_vol: float) -> dict:
         )
 
     # ── Entry Validity ───────────────────────────────────────────────────────
-    # Entry is valid if 4 of 5 Phase 2 indicators align
-    phase2_checks = [
-        (is_long and above_vwap) or (not is_long and not above_vwap),
-        (is_long and ema_bullish) or (not is_long and not ema_bullish),
-        (is_long and above_emas) or (not is_long and not above_emas),
-        (is_long and RSI_LONG_MIN <= rsi <= RSI_LONG_MAX) or
-        (not is_long and RSI_SHORT_MIN <= rsi <= RSI_SHORT_MAX),
-        rel_cvol >= VOLUME_MULT,   # uses the NaN-safe value
-    ]
-    result["entry_valid"] = sum(phase2_checks) >= 4
+    # Strategy requires all 4 entry signals: VWAP, EMA/price alignment, RSI, volume.
+    vwap_ok = (is_long and above_vwap) or (not is_long and not above_vwap)
+    ema_ok = ((is_long and ema_bullish and above_emas) or
+              (not is_long and not ema_bullish and not above_emas))
+    rsi_ok = ((is_long and RSI_LONG_MIN <= rsi <= RSI_LONG_MAX) or
+              (not is_long and RSI_SHORT_MIN <= rsi <= RSI_SHORT_MAX))
+    volume_ok = rel_cvol >= VOLUME_MULT
+    result["entry_valid"] = all([vwap_ok, ema_ok, rsi_ok, volume_ok])
 
     # ── Stop & Target Calculation ────────────────────────────────────────────
     candle_low  = df["low"].iloc[-3:].min()
@@ -641,93 +649,110 @@ def print_kill_switches(account: float, losses_today: int, down_pct: float):
 # 5. SMS — Gmail → T-Mobile gateway
 # ══════════════════════════════════════════════════════════════════════════════
 
-def send_sms(message: str, dry_run: bool = False) -> bool:
-    """
-    Send an SMS via Gmail → T-Mobile email gateway (number@tmomail.net).
-    Returns True on success. If dry_run=True, prints instead of sending.
-    """
+def _smtp_send(to_addr: str, subject: str, body: str) -> bool:
+    """Send a plain-text email using Gmail SMTP."""
     import smtplib
     from email.message import EmailMessage
-
-    if dry_run:
-        console.print(Panel(
-            f"[bold yellow]📱 DRY RUN — SMS not sent[/bold yellow]\n\n{message}",
-            border_style="yellow", expand=False
-        ))
-        return True
 
     missing = [k for k, v in {
         "GMAIL_ADDRESS":      GMAIL_ADDRESS,
         "GMAIL_APP_PASSWORD": GMAIL_APP_PASSWORD,
-        "TMOBILE_NUMBER":     TMOBILE_NUMBER,
     }.items() if not v]
-
     if missing:
-        console.print(
-            f"[red]✗ SMS skipped — missing env vars: {', '.join(missing)}[/red]\n"
-            "[dim]  Set them as GitHub Secrets or pass --no-sms to suppress this warning.[/dim]"
-        )
+        console.print(f"[red]✗ Email/SMS skipped — missing env vars: {', '.join(missing)}[/red]")
+        return False
+
+    try:
+        em = EmailMessage()
+        em["From"] = GMAIL_ADDRESS
+        em["To"] = to_addr
+        em["Subject"] = subject
+        em.set_content(body)
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+            smtp.send_message(em)
+        return True
+    except Exception as e:
+        console.print(f"[red]✗ SMTP send failed: {e}[/red]")
+        return False
+
+
+def send_sms(message: str, dry_run: bool = False) -> bool:
+    """Send SMS only when a qualifying stock is found."""
+    if dry_run:
+        console.print(Panel(f"[bold yellow]📱 DRY RUN — SMS not sent[/bold yellow]\n\n{message}",
+                            border_style="yellow", expand=False))
+        return True
+
+    if not TMOBILE_NUMBER:
+        console.print("[red]✗ SMS skipped — missing env var: TMOBILE_NUMBER[/red]")
         return False
 
     number_clean = "".join(c for c in TMOBILE_NUMBER if c.isdigit())
     if len(number_clean) == 11 and number_clean.startswith("1"):
         number_clean = number_clean[1:]
-    to_gateway = f"{number_clean}@tmomail.net"
+    if len(number_clean) != 10:
+        console.print("[red]✗ SMS skipped — TMOBILE_NUMBER must be a 10-digit number[/red]")
+        return False
 
-    try:
-        em = EmailMessage()
-        em["From"]    = GMAIL_ADDRESS
-        em["To"]      = to_gateway
-        em["Subject"] = ""
-        em.set_content(message)
+    return _smtp_send(f"{number_clean}@tmomail.net", "Trading Scanner Pick", message)
 
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-            smtp.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-            smtp.send_message(em)
 
-        console.print(f"[green]✓ SMS sent → {to_gateway}[/green]")
+def send_email_alert(subject: str, body: str, dry_run: bool = False) -> bool:
+    """Send the detailed stock alert email."""
+    if dry_run:
+        console.print(Panel(f"[bold yellow]✉ DRY RUN — Email not sent[/bold yellow]\n\nSubject: {subject}\n\n{body}",
+                            border_style="yellow", expand=False))
         return True
-
-    except smtplib.SMTPAuthenticationError:
-        console.print(
-            "[red]✗ Gmail authentication failed.[/red]\n"
-            "[dim]  Make sure you're using a Gmail App Password, not your regular password.\n"
-            "  Generate one at: myaccount.google.com/apppasswords[/dim]"
-        )
+    if not EMAIL_TO:
+        console.print("[red]✗ Email skipped — EMAIL_TO is empty and GMAIL_ADDRESS is not set[/red]")
         return False
-    except Exception as e:
-        console.print(f"[red]✗ SMS failed: {e}[/red]")
-        return False
+    return _smtp_send(EMAIL_TO, subject, body)
 
 
-def build_sms(scan_num: int, top: dict | None,
-              valid_entries: list[dict], account: float, risk_pct: float) -> str:
-    """Build a concise SMS message for the top pick."""
+def build_sms(scan_num: int, valid_entries: list[dict], account: float, risk_pct: float) -> str:
+    """Build a concise SMS for newly qualifying stocks only."""
     now_str = datetime.now(ET).strftime("%H:%M")
-
-    if not top:
-        return (
-            f"📊 Trading Scanner [{now_str}] Scan #{scan_num}\n"
-            "No valid entries found this scan.\n"
-            "All 4 indicators not yet aligned — waiting."
-        )
-
+    top = valid_entries[0]
     sizing = compute_position_size(top["price"], top["stop_price"], account, risk_pct)
     others = [r["ticker"] for r in valid_entries[1:3]]
     others_str = f"\nAlso valid: {', '.join(others)}" if others else ""
 
     return (
-        f"🎯 TOP PICK: {top['ticker']} [{now_str}] Scan #{scan_num}\n"
-        f"Dir: {top['direction']}  Score: {top['score']}/100\n"
-        f"Entry: ~${top['price']:.2f}\n"
-        f"Stop:  ${top['stop_price']}\n"
-        f"T1:    ${top['target_price']} (2:1 R:R)\n"
-        f"Shares: {sizing['shares']}  Risk: ${sizing['dollar_risk']:.0f}\n"
-        f"Gap: {top['change_pct']:+.1f}%  RSI: {top.get('rsi','—')}  "
-        f"RVOL: {top.get('rvol',0):.1f}x"
+        f"🎯 Trading Scanner Pick [{now_str}] Scan #{scan_num}\n"
+        f"{top['ticker']} {top['direction']} Score {top['score']}/100\n"
+        f"Entry ~${top['price']:.2f} | Stop ${top['stop_price']} | T1 ${top['target_price']}\n"
+        f"Shares {sizing['shares']} | Risk ${sizing['dollar_risk']:.0f}\n"
+        f"Gap {top['change_pct']:+.1f}% | RSI {top.get('rsi','—')} | RVOL {top.get('rvol',0):.1f}x"
         f"{others_str}\n"
-        "⚠ Educational only. Not financial advice."
+        "Educational only. Not financial advice."
     )
+
+
+def build_email(scan_num: int, valid_entries: list[dict], account: float, risk_pct: float) -> tuple[str, str]:
+    """Build the detailed email for all qualifying stocks found in a scan."""
+    now_str = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
+    subject = f"Trading Scanner Alert — {len(valid_entries)} qualifying stock(s) found"
+    lines = [
+        f"Trading Scanner Alert — Scan #{scan_num}",
+        f"Time: {now_str}",
+        f"Price filter: ${MIN_PRICE:.0f}–${MAX_PRICE:.0f}",
+        "Strategy: Momentum Breakout with VWAP, EMA, RSI, and Volume confirmation",
+        "",
+    ]
+
+    for i, r in enumerate(valid_entries, 1):
+        sizing = compute_position_size(r["price"], r["stop_price"], account, risk_pct)
+        lines += [
+            f"{i}. {r['ticker']} — {r['direction']} — Score {r['score']}/100",
+            f"   Price: ${r['price']:.2f} | Gap: {r['change_pct']:+.1f}% | RVOL: {r.get('rvol',0):.1f}x | RSI: {r.get('rsi','—')}",
+            f"   Stop: ${r['stop_price']} | Target 1: ${r['target_price']} | Shares: {sizing['shares']} | Risk: ${sizing['dollar_risk']:.0f}",
+            f"   Signals: {'; '.join(r['signals'])}",
+            "",
+        ]
+
+    lines.append("Educational only. Not financial advice.")
+    return subject, "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -740,161 +765,82 @@ def is_trading_window() -> bool:
     return TRADING_START <= now < TRADING_END
 
 
+def run_one_scan(top_n: int, account: float, risk_pct: float) -> list[dict]:
+    """Run one strategy scan and return only valid entries."""
+    gainers = scrape_top_gainers(top_n)
+    results = []
+
+    for stock in gainers:
+        if not (MIN_PRICE <= float(stock.get("price", 0)) <= MAX_PRICE):
+            continue
+        avg_vol = fetch_30d_avg_volume(stock["ticker"])
+        df = fetch_intraday_data(stock["ticker"])
+        eval_r = evaluate_stock(stock, df, avg_vol)
+        results.append(eval_r)
+        time.sleep(0.3)
+
+    if results:
+        print_summary_table(results)
+        console.print()
+
+    return [r for r in sorted(results, key=lambda x: x["score"], reverse=True) if r["entry_valid"]]
+
+
 def run_scheduler(account: float, risk_pct: float, top_n: int,
                   losses: int, down_pct: float, dry_run: bool):
     """
-    Loop: scan every 5 minutes between 9:30 and 10:30 AM ET, then exit.
-    Sends an SMS after each scan if a valid entry is found.
-
-    FIX #1 + #2: Removed the pre-open wait sleep. Cron now fires exactly at
-    9:30 AM ET so there is no gap between job start and window open. Removing
-    the sleep also eliminates the race condition where a long sleep could push
-    past 10:30 AM before the first scan ran.
+    Loop every 5 minutes from 9:30 through 10:30 AM ET.
+    Email and text are sent only when one or more qualifying stocks are found.
     """
     if not is_trading_window():
-        now_str = datetime.now(ET).strftime("%H:%M")
-        msg = (
-            f"⚠ Trading Scanner [{now_str}]\n"
-            "Outside the 9:30–10:30 AM ET window — no scan run.\n"
-            "Check cron schedule or use --run-once to test outside hours."
-        )
-        console.print(f"[yellow]{msg}[/yellow]")
-        # FIX #3: was hardcoded dry_run=False, now correctly respects the flag
-        if not dry_run:
-            send_sms(msg, dry_run=False)
+        console.print("[yellow]Outside the 9:30–10:30 AM ET window — no scan run and no text sent.[/yellow]")
         return
 
-    scan_num   = 0
-    texted     = set()   # tickers already texted this session
-    # FIX #7: track whether we've sent a "no pick" SMS this session.
-    # We only send one at the start and one at the end to avoid SMS spam.
-    no_pick_sms_sent = False
+    scan_num = 0
+    texted = set()
 
     console.print(Panel(
         f"[bold green]🟢 SCANNER STARTED[/bold green]\n"
-        f"Running every {SCAN_INTERVAL_MINS} minutes  •  "
-        f"Window: 9:30 – 10:30 AM ET\n"
-        f"SMS {'DISABLED (dry run)' if dry_run else 'ENABLED → ' + (TMOBILE_NUMBER or 'number not set')}",
+        f"Scanning every {SCAN_INTERVAL_MINS} minutes until 10:30 AM ET\n"
+        "Alerts will be sent only when qualifying stocks are found.",
         border_style="green", expand=False
     ))
-    console.print()
-
-    # Startup heartbeat — confirms the job fired and SMS credentials work
-    if not dry_run:
-        now_str = datetime.now(ET).strftime("%H:%M")
-        send_sms(
-            f"🟢 Trading Scanner started [{now_str}]\n"
-            f"Scanning every {SCAN_INTERVAL_MINS} min until 10:30 AM ET.\n"
-            "Will text picks as found.",
-            dry_run=False
-        )
 
     while is_trading_window():
         scan_num += 1
         scan_start = datetime.now(ET)
+        console.rule(f"[bold cyan]SCAN #{scan_num} — {scan_start.strftime('%H:%M:%S')} ET[/bold cyan]")
 
-        console.rule(
-            f"[bold cyan]SCAN #{scan_num}  —  "
-            f"{scan_start.strftime('%H:%M:%S')} ET[/bold cyan]"
-        )
+        valid_entries = run_one_scan(top_n, account, risk_pct)
+        new_entries = [r for r in valid_entries if r["ticker"] not in texted]
 
-        gainers = scrape_top_gainers(top_n)
-        results = []
-
-        if gainers:
-            for stock in gainers:
-                ticker  = stock["ticker"]
-                avg_vol = fetch_30d_avg_volume(ticker)
-                df      = fetch_intraday_data(ticker)
-                eval_r  = evaluate_stock(stock, df, avg_vol)
-                results.append(eval_r)
-                time.sleep(0.3)
-
-            print_summary_table(results)
-            console.print()
-
-            sorted_results = sorted(results, key=lambda x: x["score"], reverse=True)
-            valid_entries  = [r for r in sorted_results if r["entry_valid"]]
-            top            = valid_entries[0] if valid_entries else None
-
-            if top and top["ticker"] not in texted:
-                sms_body = build_sms(scan_num, top, valid_entries, account, risk_pct)
-                sent = send_sms(sms_body, dry_run=dry_run)
-                if sent:
-                    texted.add(top["ticker"])
-                    console.print(
-                        f"[green]📱 Texted alert for {top['ticker']}[/green]"
-                    )
-            elif top and top["ticker"] in texted:
-                console.print(
-                    f"[dim]⏭  {top['ticker']} already texted this session — skipping SMS[/dim]"
-                )
-            else:
-                # FIX #7: No valid pick. Send one SMS at the start of the session
-                # so you know the scanner is running but hasn't found anything yet.
-                # After that, stay quiet until end-of-session summary to avoid spam.
-                if not no_pick_sms_sent:
-                    send_sms(
-                        build_sms(scan_num, None, [], account, risk_pct),
-                        dry_run=dry_run
-                    )
-                    no_pick_sms_sent = True
-                else:
-                    console.print(
-                        f"[dim]  Scan #{scan_num}: no valid pick — holding SMS (already notified)[/dim]"
-                    )
-
+        if new_entries:
+            subject, email_body = build_email(scan_num, new_entries, account, risk_pct)
+            send_email_alert(subject, email_body, dry_run=dry_run)
+            send_sms(build_sms(scan_num, new_entries, account, risk_pct), dry_run=dry_run)
+            texted.update(r["ticker"] for r in new_entries)
+            console.print(f"[green]Alerts sent for: {', '.join(r['ticker'] for r in new_entries)}[/green]")
         else:
-            console.print("[red]No gainers returned — all data sources may be blocked.[/red]")
-            now_str = datetime.now(ET).strftime("%H:%M")
-            send_sms(
-                f"⚠ Trading Scanner [{now_str}] Scan #{scan_num}\n"
-                "All data sources returned 0 gainers.\n"
-                "Check GitHub Actions logs.",
-                dry_run=dry_run
-            )
+            console.print("[dim]No new qualifying stocks found — no text/email sent.[/dim]")
 
         print_kill_switches(account, losses, down_pct)
 
-        if not is_trading_window():
-            break
-
-        elapsed  = (datetime.now(ET) - scan_start).total_seconds()
-        sleep_s  = max(0, SCAN_INTERVAL_MINS * 60 - elapsed)
-        next_at  = datetime.now(ET) + timedelta(seconds=sleep_s)
+        elapsed = (datetime.now(ET) - scan_start).total_seconds()
+        sleep_s = max(0, SCAN_INTERVAL_MINS * 60 - elapsed)
+        next_at = datetime.now(ET) + timedelta(seconds=sleep_s)
 
         if next_at.time() >= TRADING_END:
-            console.print(
-                f"\n[dim]Next scan at {next_at.strftime('%H:%M')} ET "
-                f"would be after 10:30 AM — stopping now.[/dim]"
-            )
             break
 
-        console.print(
-            f"\n[dim]Next scan in {sleep_s/60:.1f} min  "
-            f"({next_at.strftime('%H:%M:%S')} ET)[/dim]\n"
-        )
+        console.print(f"\n[dim]Next scan at {next_at.strftime('%H:%M:%S')} ET[/dim]\n")
         time.sleep(sleep_s)
 
-    # ── Session complete ─────────────────────────────────────────────────────
-    console.print()
     console.print(Panel(
-        f"[bold yellow]🏁 SCANNER STOPPED — First-hour window closed[/bold yellow]\n"
-        f"Completed {scan_num} scan{'s' if scan_num != 1 else ''}  •  "
-        f"Tickers texted: {', '.join(texted) if texted else 'none'}\n\n"
-        "[dim]Strategy: avoid 11:30 AM–1:30 PM lunch chop. "
-        "Close all positions by 3:45 PM.[/dim]",
+        f"[bold yellow]🏁 SCANNER STOPPED — 10:30 AM ET window closed[/bold yellow]\n"
+        f"Completed {scan_num} scan{'s' if scan_num != 1 else ''}.\n"
+        f"Tickers alerted: {', '.join(sorted(texted)) if texted else 'none'}",
         border_style="yellow"
     ))
-
-    # Session-complete heartbeat
-    if not dry_run:
-        now_str = datetime.now(ET).strftime("%H:%M")
-        send_sms(
-            f"🏁 Scanner done [{now_str}] — {scan_num} scan{'s' if scan_num != 1 else ''} completed.\n"
-            f"Picks texted: {', '.join(texted) if texted else 'none'}.",
-            dry_run=False
-        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -922,29 +868,15 @@ def main():
     args = parser.parse_args()
 
     if args.run_once:
-        # Single scan — useful for testing outside market hours
+        # Single scan — useful for testing. Alerts are still sent only if stocks qualify.
         console.print("[cyan]▶ Running single scan (--run-once)[/cyan]\n")
-        gainers = scrape_top_gainers(args.top)
-        results = []
-        for stock in gainers:
-            avg_vol = fetch_30d_avg_volume(stock["ticker"])
-            df      = fetch_intraday_data(stock["ticker"])
-            eval_r  = evaluate_stock(stock, df, avg_vol)
-            results.append(eval_r)
-            time.sleep(0.3)
-
-        if results:
-            print_summary_table(results)
-            sorted_results = sorted(results, key=lambda x: x["score"], reverse=True)
-            for r in sorted_results:
-                print_detailed_card(r, args.account, args.risk)
-                console.print()
-
-            valid  = [r for r in sorted_results if r["entry_valid"]]
-            top    = valid[0] if valid else None
-            sms    = build_sms(1, top, valid, args.account, args.risk)
-            send_sms(sms, dry_run=args.no_sms)
-
+        valid = run_one_scan(args.top, args.account, args.risk)
+        if valid:
+            subject, email_body = build_email(1, valid, args.account, args.risk)
+            send_email_alert(subject, email_body, dry_run=args.no_sms)
+            send_sms(build_sms(1, valid, args.account, args.risk), dry_run=args.no_sms)
+        else:
+            console.print("[dim]No qualifying stocks found — no text/email sent.[/dim]")
         print_kill_switches(args.account, args.losses, args.down)
     else:
         run_scheduler(
