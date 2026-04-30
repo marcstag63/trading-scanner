@@ -2,17 +2,18 @@ name: Trading Scanner
 
 on:
   schedule:
-    # 9:30 AM ET — UTC-4 in summer (EDT), UTC-5 in winter (EST)
-    # Summer:  13:30 UTC  ← use this Mar–Nov (EDT)
-    # Winter:  14:30 UTC  ← use this Nov–Mar (EST)
-    - cron: '30 13 * * 1-5'   # Mon–Fri 9:30 AM EDT  ← FIX: was 25 13, fired before window opened
+    # GitHub Actions cron uses UTC. These two schedules cover 9:30 AM ET
+    # during both daylight saving time and standard time. The Python script
+    # checks the ET trading window, so the non-matching seasonal run exits quietly.
+    - cron: '30 13 * * 1-5'   # 9:30 AM ET during daylight saving time
+    - cron: '30 14 * * 1-5'   # 9:30 AM ET during standard time
 
-  workflow_dispatch:           # allows manual trigger from GitHub UI
+  workflow_dispatch:
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 90        # kills job if something hangs (1hr scan + buffer)
+    timeout-minutes: 75
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -34,5 +35,6 @@ jobs:
           GMAIL_ADDRESS:      ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           TMOBILE_NUMBER:     ${{ secrets.TMOBILE_NUMBER }}
-        run: python day_trading_scanner.py --account 10000 --risk 1.0
+          EMAIL_TO:           ${{ secrets.EMAIL_TO }}
+        run: python day_trading_scanner.py --account 10000 --risk 1.0 --top 20
         continue-on-error: false
