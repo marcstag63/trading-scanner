@@ -2,18 +2,19 @@ name: Trading Scanner
 
 on:
   schedule:
-    # GitHub Actions cron uses UTC. These two schedules cover 9:30 AM ET
-    # during both daylight saving time and standard time. The Python script
-    # checks the ET trading window, so the non-matching seasonal run exits quietly.
-    - cron: '30 13 * * 1-5'   # 9:30 AM ET during daylight saving time
-    - cron: '30 14 * * 1-5'   # 9:30 AM ET during standard time
+    # GitHub Actions cron uses UTC. Fire once at 9:30 AM ET — the Python script
+    # loops every 5 minutes internally until 10:30 AM ET, so we only need one
+    # trigger per day. Two entries cover DST: the non-matching one exits quietly.
+    - cron: '30 13 * * 1-5'   # 9:30 AM ET during EDT (UTC-4, Mar–Nov)
+    - cron: '30 14 * * 1-5'   # 9:30 AM ET during EST (UTC-5, Nov–Mar)
 
   workflow_dispatch:
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    # 60-min trading window + up to 5 min per scan overhead + buffer = 90 min
+    timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
