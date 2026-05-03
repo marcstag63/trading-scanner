@@ -92,55 +92,48 @@ console = Console(force_terminal=True)
 
 def scrape_top_gainers(top_n: int = 5) -> list[dict]:
     """
-    Scrape top gainers. Tries Yahoo Finance (JS-rendered so usually fails),
-    then Finviz, then falls back to yfinance screener API.
+    Fetch top gainers. Source priority:
+      1. yfinance built-in screener (most reliable, uses Yahoo Finance API directly)
+      2. Finviz HTML scrape (reliable fallback)
+      3. Yahoo Finance HTML scrape (JS-rendered, usually returns 0 rows — last resort)
     Returns a list of dicts with ticker, name, price, change_pct, volume.
     """
-    tickers = []
 
-    # ── Primary: Yahoo Finance ────────────────────────────────────────────────
-    # NOTE: Yahoo Finance is JS-rendered; BeautifulSoup will usually get 0 rows.
-    # The code is kept for completeness but the fallbacks below are more reliable.
+    # ── Primary: yfinance built-in screener ───────────────────────────────────
+    # Requires yfinance >= 0.2.38. Queries Yahoo's backend API directly,
+    # bypassing the JS-rendered HTML that BeautifulSoup cannot parse.
     try:
-        url = "https://finance.yahoo.com/screener/predefined/day_gainers"
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+        console.print("[cyan]  Fetching top gainers via yfinance screener…[/cyan]")
+        screener_result = yf.screen("day_gainers")
+        quotes = screener_result.get("quotes", [])
 
-        rows = soup.select("table tbody tr")
-        console.print(f"[dim]  Yahoo Finance: found {len(rows)} raw rows[/dim]")
-        for row in rows[:top_n * 2]:
-            cols = row.find_all("td")
-            if len(cols) < 6:
-                continue
-            try:
-                ticker     = cols[0].get_text(strip=True)
-                name       = cols[1].get_text(strip=True)
-                price      = float(cols[2].get_text(strip=True).replace(",", ""))
-                change_pct = float(cols[4].get_text(strip=True).replace("%", ""))
-                volume_raw = cols[5].get_text(strip=True).replace(",", "")
-                volume     = _parse_volume(volume_raw)
-                tickers.append({
-                    "ticker":     ticker,
+        records = []
+        for q in quotes:
+            sym   = q.get("symbol", "")
+            price = q.get("regularMarketPrice", 0) or 0
+            chg   = q.get("regularMarketChangePercent", 0) or 0
+            vol   = q.get("regularMarketVolume", 0) or 0
+            name  = q.get("shortName", sym)
+            if price > 0 and sym:
+                records.append({
+                    "ticker":     sym,
                     "name":       name,
-                    "price":      price,
-                    "change_pct": change_pct,
-                    "volume":     volume,
-                    "source":     "Yahoo Finance",
+                    "price":      round(price, 2),
+                    "change_pct": round(chg, 2),
+                    "volume":     int(vol),
+                    "source":     "yfinance-screener",
                 })
-            except (ValueError, IndexError):
-                continue
 
-        if tickers:
-            console.print(f"[green]✓[/green] Scraped {len(tickers)} gainers from Yahoo Finance")
-            return tickers[:top_n]
-        else:
-            console.print("[yellow]⚠ Yahoo Finance returned 0 parseable rows (JS-rendered page) — trying Finviz[/yellow]")
+        records.sort(key=lambda x: x["change_pct"], reverse=True)
+        if records:
+            console.print(f"[green]✓[/green] yfinance screener returned {len(records)} tickers")
+            return records[:top_n]
+        console.print("[yellow]⚠ yfinance screener returned 0 results — trying Finviz[/yellow]")
 
     except Exception as e:
-        console.print(f"[yellow]⚠ Yahoo Finance scrape failed: {e}[/yellow]")
+        console.print(f"[yellow]⚠ yfinance screener failed: {e} — trying Finviz[/yellow]")
 
-    # ── Fallback: Finviz ──────────────────────────────────────────────────────
+    # ── Fallback 1: Finviz ────────────────────────────────────────────────────
     try:
         url = (
             "https://finviz.com/screener.ashx?v=111&s=ta_topgainers"
@@ -153,6 +146,7 @@ def scrape_top_gainers(top_n: int = 5) -> list[dict]:
         rows = soup.select("table.screener-table tr.table-light-row-cp, "
                            "table.screener-table tr.table-dark-row-cp")
         console.print(f"[dim]  Finviz: found {len(rows)} raw rows[/dim]")
+        tickers = []
         for row in rows[:top_n * 2]:
             cols = row.find_all("td")
             if len(cols) < 10:
@@ -176,50 +170,49 @@ def scrape_top_gainers(top_n: int = 5) -> list[dict]:
         if tickers:
             console.print(f"[green]✓[/green] Scraped {len(tickers)} gainers from Finviz")
             return tickers[:top_n]
+        console.print("[yellow]⚠ Finviz returned 0 parseable rows — trying Yahoo Finance HTML[/yellow]")
 
     except Exception as e:
-        console.print(f"[yellow]⚠ Finviz scrape failed: {e}[/yellow]")
+        console.print(f"[yellow]⚠ Finviz scrape failed: {e} — trying Yahoo Finance HTML[/yellow]")
 
-    # ── Fallback 2: yfinance built-in screener ────────────────────────────────
-    # FIX #5: The old fallback used a hardcoded seed list of mega-caps (NVDA,
-    # AAPL, TSLA…) which never meet MIN_PRICE<=30 + MIN_GAP_PCT>=3% + MIN_RVOL>=2x
-    # simultaneously, meaning evaluate_stock() always returned entry_valid=False
-    # and no SMS was ever sent from this path.
-    # Replaced with yfinance's built-in screener (requires yfinance >= 0.2.38).
+    # ── Fallback 2: Yahoo Finance HTML (usually fails — JS-rendered) ──────────
     try:
-        console.print("[cyan]  Trying yfinance built-in screener…[/cyan]")
-        from yfinance import screen  # noqa: F401 — available in yfinance >= 0.2.38
+        url = "https://finance.yahoo.com/screener/predefined/day_gainers"
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-        # day_gainers screen returns stocks sorted by % change, already filtered
-        # for meaningful volume by Yahoo's backend.
-        screener_result = yf.screen("day_gainers")
-        quotes = screener_result.get("quotes", [])
-
-        records = []
-        for q in quotes:
-            sym   = q.get("symbol", "")
-            price = q.get("regularMarketPrice", 0) or 0
-            chg   = q.get("regularMarketChangePercent", 0) or 0
-            vol   = q.get("regularMarketVolume", 0) or 0
-            name  = q.get("shortName", sym)
-            if price > 0 and sym:
-                records.append({
-                    "ticker":     sym,
+        rows = soup.select("table tbody tr")
+        console.print(f"[dim]  Yahoo Finance HTML: found {len(rows)} raw rows[/dim]")
+        tickers = []
+        for row in rows[:top_n * 2]:
+            cols = row.find_all("td")
+            if len(cols) < 6:
+                continue
+            try:
+                ticker     = cols[0].get_text(strip=True)
+                name       = cols[1].get_text(strip=True)
+                price      = float(cols[2].get_text(strip=True).replace(",", ""))
+                change_pct = float(cols[4].get_text(strip=True).replace("%", ""))
+                volume_raw = cols[5].get_text(strip=True).replace(",", "")
+                volume     = _parse_volume(volume_raw)
+                tickers.append({
+                    "ticker":     ticker,
                     "name":       name,
-                    "price":      round(price, 2),
-                    "change_pct": round(chg, 2),
-                    "volume":     int(vol),
-                    "source":     "yfinance-screener",
+                    "price":      price,
+                    "change_pct": change_pct,
+                    "volume":     volume,
+                    "source":     "Yahoo Finance",
                 })
+            except (ValueError, IndexError):
+                continue
 
-        # Sort by % change descending (screener may already do this)
-        records.sort(key=lambda x: x["change_pct"], reverse=True)
-        if records:
-            console.print(f"[green]✓[/green] yfinance screener returned {len(records)} tickers")
-            return records[:top_n]
+        if tickers:
+            console.print(f"[green]✓[/green] Scraped {len(tickers)} gainers from Yahoo Finance HTML")
+            return tickers[:top_n]
 
     except Exception as e:
-        console.print(f"[yellow]⚠ yfinance screener failed: {e}[/yellow]")
+        console.print(f"[yellow]⚠ Yahoo Finance HTML scrape failed: {e}[/yellow]")
 
     console.print("[red]✗ All data sources failed. Check internet connection / API access.[/red]")
     return []
@@ -711,20 +704,25 @@ def send_email_alert(subject: str, body: str, dry_run: bool = False) -> bool:
 
 
 def build_sms(scan_num: int, valid_entries: list[dict], account: float, risk_pct: float) -> str:
-    """Build a concise SMS for newly qualifying stocks only."""
+    """
+    Build a concise SMS listing ALL qualifying tickers found this scan,
+    with a one-line summary for the top pick. Sent every scan that has valid entries.
+    """
     now_str = datetime.now(ET).strftime("%H:%M")
     top = valid_entries[0]
     sizing = compute_position_size(top["price"], top["stop_price"], account, risk_pct)
-    others = [r["ticker"] for r in valid_entries[1:3]]
-    others_str = f"\nAlso valid: {', '.join(others)}" if others else ""
+
+    # All qualifying ticker names in one line
+    all_tickers = ", ".join(r["ticker"] for r in valid_entries)
 
     return (
-        f"🎯 Trading Scanner Pick [{now_str}] Scan #{scan_num}\n"
-        f"{top['ticker']} {top['direction']} Score {top['score']}/100\n"
-        f"Entry ~${top['price']:.2f} | Stop ${top['stop_price']} | T1 ${top['target_price']}\n"
+        f"📈 Scanner Scan #{scan_num} [{now_str} ET]\n"
+        f"Picks: {all_tickers}\n"
+        f"Top: {top['ticker']} {top['direction']} ${top['price']:.2f} "
+        f"| Stop ${top['stop_price']} | T1 ${top['target_price']}\n"
+        f"Score {top['score']}/100 | Gap {top['change_pct']:+.1f}% "
+        f"| RSI {top.get('rsi','—')} | RVOL {top.get('rvol',0):.1f}x\n"
         f"Shares {sizing['shares']} | Risk ${sizing['dollar_risk']:.0f}\n"
-        f"Gap {top['change_pct']:+.1f}% | RSI {top.get('rsi','—')} | RVOL {top.get('rvol',0):.1f}x"
-        f"{others_str}\n"
         "Educational only. Not financial advice."
     )
 
@@ -790,19 +788,21 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
                   losses: int, down_pct: float, dry_run: bool):
     """
     Loop every 5 minutes from 9:30 through 10:30 AM ET.
-    Email and text are sent only when one or more qualifying stocks are found.
+    A text and email are sent every scan that finds qualifying stocks —
+    not just on the first occurrence — so you get fresh picks each interval.
+    The loop runs until is_trading_window() returns False (i.e. 10:30 AM ET).
     """
     if not is_trading_window():
         console.print("[yellow]Outside the 9:30–10:30 AM ET window — no scan run and no text sent.[/yellow]")
         return
 
     scan_num = 0
-    texted = set()
+    alerted_tickers: list[str] = []  # running log of all tickers ever alerted (for final summary)
 
     console.print(Panel(
         f"[bold green]🟢 SCANNER STARTED[/bold green]\n"
         f"Scanning every {SCAN_INTERVAL_MINS} minutes until 10:30 AM ET\n"
-        "Alerts will be sent only when qualifying stocks are found.",
+        "A text is sent every scan that finds qualifying stocks.",
         border_style="green", expand=False
     ))
 
@@ -812,25 +812,25 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
         console.rule(f"[bold cyan]SCAN #{scan_num} — {scan_start.strftime('%H:%M:%S')} ET[/bold cyan]")
 
         valid_entries = run_one_scan(top_n, account, risk_pct)
-        new_entries = [r for r in valid_entries if r["ticker"] not in texted]
 
-        if new_entries:
-            subject, email_body = build_email(scan_num, new_entries, account, risk_pct)
+        if valid_entries:
+            subject, email_body = build_email(scan_num, valid_entries, account, risk_pct)
             send_email_alert(subject, email_body, dry_run=dry_run)
-            send_sms(build_sms(scan_num, new_entries, account, risk_pct), dry_run=dry_run)
-            texted.update(r["ticker"] for r in new_entries)
-            console.print(f"[green]Alerts sent for: {', '.join(r['ticker'] for r in new_entries)}[/green]")
+            send_sms(build_sms(scan_num, valid_entries, account, risk_pct), dry_run=dry_run)
+            alerted_tickers.extend(r["ticker"] for r in valid_entries)
+            console.print(f"[green]Alerts sent for: {', '.join(r['ticker'] for r in valid_entries)}[/green]")
         else:
-            console.print("[dim]No new qualifying stocks found — no text/email sent.[/dim]")
+            console.print("[dim]No qualifying stocks found this scan — no text/email sent.[/dim]")
 
         print_kill_switches(account, losses, down_pct)
 
+        # Sleep until next 5-min mark, but only if we're still in the window
         elapsed = (datetime.now(ET) - scan_start).total_seconds()
         sleep_s = max(0, SCAN_INTERVAL_MINS * 60 - elapsed)
         next_at = datetime.now(ET) + timedelta(seconds=sleep_s)
 
-        if next_at.time() >= TRADING_END:
-            break
+        if not is_trading_window():
+            break  # window closed while scan was running
 
         console.print(f"\n[dim]Next scan at {next_at.strftime('%H:%M:%S')} ET[/dim]\n")
         time.sleep(sleep_s)
@@ -838,7 +838,7 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
     console.print(Panel(
         f"[bold yellow]🏁 SCANNER STOPPED — 10:30 AM ET window closed[/bold yellow]\n"
         f"Completed {scan_num} scan{'s' if scan_num != 1 else ''}.\n"
-        f"Tickers alerted: {', '.join(sorted(texted)) if texted else 'none'}",
+        f"Tickers alerted: {', '.join(alerted_tickers) if alerted_tickers else 'none'}",
         border_style="yellow"
     ))
 
