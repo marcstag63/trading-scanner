@@ -2,40 +2,47 @@ name: Trading Scanner
 
 on:
   schedule:
-    # GitHub Actions cron uses UTC. Fire once at 9:30 AM ET — the Python script
-    # loops every 5 minutes internally until 10:30 AM ET, so we only need one
-    # trigger per day. Two entries cover DST: the non-matching one exits quietly.
-    - cron: '30 13 * * 1-5'   # 9:30 AM ET during EDT (UTC-4, Mar–Nov)
-    - cron: '30 14 * * 1-5'   # 9:30 AM ET during EST (UTC-5, Nov–Mar)
-
+    # GitHub Actions cron is UTC. These two entries cover daylight saving time.
+    # The Python script itself enforces the 9:30-10:30 AM ET window, so the
+    # non-matching DST trigger exits without scanning.
+    - cron: '30 13 * * 1-5'   # 9:30 AM ET during EDT
+    - cron: '30 14 * * 1-5'   # 9:30 AM ET during EST
   workflow_dispatch:
+
+concurrency:
+  group: trading-scanner
+  cancel-in-progress: true
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    # 60-min trading window + up to 5 min per scan overhead + buffer = 90 min
     timeout-minutes: 90
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4.2.2
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5.6.0
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests beautifulsoup4 pandas yfinance ta rich
+          fi
 
       - name: Run trading scanner
         env:
-          GMAIL_ADDRESS:      ${{ secrets.GMAIL_ADDRESS }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          TMOBILE_NUMBER:     ${{ secrets.TMOBILE_NUMBER }}
-          EMAIL_TO:           ${{ secrets.EMAIL_TO }}
+          # Uses GitHub Secrets first. If you accidentally saved them as
+          # Repository Variables, the vars fallback still passes them to Python.
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS || vars.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD || vars.GMAIL_APP_PASSWORD }}
+          TMOBILE_NUMBER: ${{ secrets.TMOBILE_NUMBER || vars.TMOBILE_NUMBER }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO || vars.EMAIL_TO }}
         run: python day_trading_scanner.py --account 10000 --risk 1.0 --top 20
-        continue-on-error: false
