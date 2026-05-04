@@ -239,13 +239,26 @@ def _parse_volume(raw: str) -> int:
 
 def fetch_intraday_data(ticker: str) -> pd.DataFrame | None:
     """
-    Download 5-minute OHLCV data and keep only today's regular-session candles.
-    The strategy is only evaluated after the first 5-minute candle closes.
+    Download 5-minute OHLCV data and keep only today's completed regular-session
+    candles. Indicators are calculated on the full 2-day regular-session data
+    first, then today's window is selected.
+
+    This is important because the 9:30-10:30 window only has 12 five-minute
+    candles. If EMA20/RSI are calculated only after filtering to today's first
+    hour, they will be NaN for most or all of the scanning window and no stocks
+    will qualify.
     """
     try:
-        df = yf.download(ticker, period="2d", interval="5m",
-                         progress=False, auto_adjust=True, prepost=False)
-        if df.empty or len(df) < 20:
+        df = yf.download(
+            ticker,
+            period="5d",
+            interval="5m",
+            progress=False,
+            auto_adjust=True,
+            prepost=False,
+            threads=False,
+        )
+        if df.empty or len(df) < 30:
             return None
 
         if isinstance(df.columns, pd.MultiIndex):
@@ -256,31 +269,52 @@ def fetch_intraday_data(ticker: str) -> pd.DataFrame | None:
         df = df.rename(columns={"stock splits": "splits", "capital gains": "capgains"})
 
         if df.index.tz is None:
-            df.index = df.index.tz_localize(ET)
+            df.index = df.index.tz_localize("UTC").tz_convert(ET)
         else:
             df.index = df.index.tz_convert(ET)
 
-        now_et = datetime.now(ET)
-        today = now_et.date()
-        session_start = datetime.combine(today, TRADING_START, tzinfo=ET)
-
-        last_completed = now_et.replace(second=0, microsecond=0)
-        minute_floor = (last_completed.minute // 5) * 5
-        last_completed = last_completed.replace(minute=minute_floor) - timedelta(minutes=5)
-
-        df = df[(df.index >= session_start) & (df.index <= last_completed)]
-        if df.empty or len(df) < 2:
+        # Keep regular-session candles from the lookback period so EMA20/RSI can
+        # be seeded by prior trading-day candles while still excluding premarket.
+        session_mask = (
+            (df.index.time >= TRADING_START) &
+            (df.index.time <= dtime(16, 0))
+        )
+        df = df.loc[session_mask].copy()
+        if df.empty or len(df) < 30:
             return None
 
+        # Calculate indicators before narrowing to today. This fixes the first-hour bug.
         df["ema9"]  = ta.trend.ema_indicator(df["close"], window=9)
         df["ema20"] = ta.trend.ema_indicator(df["close"], window=20)
         df["rsi"]   = ta.momentum.rsi(df["close"], window=14)
         df["vwap"]  = _compute_vwap(df)
 
-        df["avg_vol"]  = df["volume"].expanding().mean()
-        df["rel_cvol"] = df["volume"] / df["avg_vol"].shift(1).fillna(1)
+        # Compare each 5-minute candle to the average of earlier 5-minute candles
+        # at the same time of day across the lookback period. This avoids NaN/0
+        # volume confirmation during the first few candles of the morning.
+        df["bar_time"] = df.index.strftime("%H:%M")
+        df["avg_same_time_vol"] = (
+            df.groupby("bar_time")["volume"]
+              .transform(lambda s: s.shift(1).expanding().mean())
+        )
+        df["rel_cvol"] = df["volume"] / df["avg_same_time_vol"].replace(0, pd.NA)
 
-        return df.dropna(subset=["ema9", "ema20", "rsi", "vwap"])
+        now_et = datetime.now(ET)
+        today = now_et.date()
+        session_start = datetime.combine(today, TRADING_START, tzinfo=ET)
+
+        # Use only completed 5-minute candles. At 9:30 there may be no completed
+        # candle yet; the next scans will evaluate once 9:30-9:35 closes.
+        minute_floor = (now_et.minute // 5) * 5
+        last_completed = now_et.replace(minute=minute_floor, second=0, microsecond=0) - timedelta(minutes=5)
+
+        today_df = df[(df.index >= session_start) & (df.index <= last_completed)].copy()
+        today_df = today_df.drop(columns=["bar_time"], errors="ignore")
+
+        if today_df.empty or len(today_df) < 1:
+            return None
+
+        return today_df.dropna(subset=["ema9", "ema20", "rsi", "vwap"])
 
     except Exception as e:
         console.print(f"  [red]✗ Data fetch failed for {ticker}: {e}[/red]")
@@ -371,12 +405,12 @@ def evaluate_stock(stock: dict, df: pd.DataFrame, avg_30d_vol: float) -> dict:
         result["red_flags"].append(f"Price ${price:.2f} out of range ✗")
 
     # ── Phase 2: Indicator Signals (last completed candle) ───────────────────
-    if df is None or len(df) < 2:
+    if df is None or len(df) < 1:
         result["score"] = score
         return result
 
     last = df.iloc[-1]
-    prev = df.iloc[-2]  # noqa: F841  (available for future use)
+    prev = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]  # available for future use
 
     # VWAP
     above_vwap = last["close"] > last["vwap"]
@@ -784,6 +818,18 @@ def run_one_scan(top_n: int, account: float, risk_pct: float) -> list[dict]:
     return [r for r in sorted(results, key=lambda x: x["score"], reverse=True) if r["entry_valid"]]
 
 
+
+def seconds_until_trading_start() -> float | None:
+    """Return seconds until today's 9:30 AM ET start, or None if already past the window."""
+    now = datetime.now(ET)
+    start_dt = datetime.combine(now.date(), TRADING_START, tzinfo=ET)
+    end_dt = datetime.combine(now.date(), TRADING_END, tzinfo=ET)
+    if now < start_dt:
+        return (start_dt - now).total_seconds()
+    if now >= end_dt:
+        return None
+    return 0.0
+
 def run_scheduler(account: float, risk_pct: float, top_n: int,
                   losses: int, down_pct: float, dry_run: bool):
     """
@@ -792,9 +838,13 @@ def run_scheduler(account: float, risk_pct: float, top_n: int,
     not just on the first occurrence — so you get fresh picks each interval.
     The loop runs until is_trading_window() returns False (i.e. 10:30 AM ET).
     """
-    if not is_trading_window():
+    wait_s = seconds_until_trading_start()
+    if wait_s is None:
         console.print("[yellow]Outside the 9:30–10:30 AM ET window — no scan run and no text sent.[/yellow]")
         return
+    if wait_s > 0:
+        console.print(f"[cyan]Workflow started before 9:30 AM ET. Waiting {wait_s/60:.1f} minute(s) for the market window.[/cyan]")
+        time.sleep(wait_s)
 
     scan_num = 0
     alerted_tickers: list[str] = []  # running log of all tickers ever alerted (for final summary)
