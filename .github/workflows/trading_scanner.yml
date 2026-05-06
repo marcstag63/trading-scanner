@@ -1,5 +1,5 @@
 name: Trading Scanner
-
+ 
 on:
   schedule:
     # GitHub Actions cron is UTC. These two entries cover daylight saving time.
@@ -8,26 +8,26 @@ on:
     - cron: '30 13 * * 1-5'   # 9:30 AM ET during EDT
     - cron: '30 14 * * 1-5'   # 9:30 AM ET during EST
   workflow_dispatch:
-
+ 
 concurrency:
   group: trading-scanner
-  cancel-in-progress: true
-
+  cancel-in-progress: false  # never cancel a running scan; the 2nd DST cron exits cleanly on its own
+ 
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 90
-
+ 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
+ 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-
+ 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -36,7 +36,7 @@ jobs:
           else
             pip install requests beautifulsoup4 pandas yfinance ta rich
           fi
-
+ 
       - name: Run trading scanner
         env:
           # Uses GitHub Secrets first. If you accidentally saved them as
@@ -46,3 +46,4 @@ jobs:
           TMOBILE_NUMBER: ${{ secrets.TMOBILE_NUMBER || vars.TMOBILE_NUMBER }}
           EMAIL_TO: ${{ secrets.EMAIL_TO || vars.EMAIL_TO }}
         run: python day_trading_scanner.py --account 10000 --risk 1.0 --top 20
+ 
